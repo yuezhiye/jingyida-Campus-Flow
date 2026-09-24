@@ -1,0 +1,17 @@
+# 编译中间产物（保留编译好的 exe，其余忽略）
+*.pdb
+*.obj
+*.user
+*.suo
+.vs/
+
+# 本机运行数据（含个人账号/IP，绝不入库）
+credential.dat
+srun.log
+config.json
+
+# 临时验证脚本（开发时用的截图/探针工具）
+_*.ps1
+_*.cs
+_*.exe
+_*.txt

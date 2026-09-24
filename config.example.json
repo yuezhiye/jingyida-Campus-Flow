@@ -1,0 +1,30 @@
+{
+  "_comment": "SrunAutoLogin 配置模板 - 适用于采用深澜（Srun）eportal 认证的校园网。把这个文件放成 %LocalAppData%\\SrunAutoLogin\\config.json 即可生效。",
+
+  "PortalUrl": "http://192.168.1.1:801/eportal/portal/login",
+  "LocalIpToken": "{local_ip}",
+
+  "AccountPrefix": ",0,",
+  "AccountSuffix": "@unicom",
+  "AccountField": "user_account",
+  "PasswordField": "user_password",
+
+  "ExtraParams": {
+    "callback": "dr1003",
+    "login_method": "1",
+    "wlan_user_ip": "{local_ip}",
+    "wlan_user_ipv6": "",
+    "wlan_user_mac": "000000000000",
+    "wlan_ac_ip": "",
+    "wlan_ac_name": "",
+    "jsVersion": "4.28",
+    "terminal_type": "1",
+    "lang": "zh-cn"
+  },
+
+  "InterfaceKeyword": "WLAN",
+  "ConnectivityUrl": "http://www.msftconnecttest.com/connecttest.txt",
+  "ConnectivityExpected": "Microsoft Connect Test",
+  "CheckIntervalSeconds": 30,
+  "TimeoutMs": 10000
+}

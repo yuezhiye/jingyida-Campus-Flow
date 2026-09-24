@@ -1,7 +1,7 @@
 // ============================================================================
 //  SrunAutoLogin - 深澜 (Srun) eportal 校园网自动认证工具
-//  适用场景：采用深澜 eportal 认证的校园网
-//  协议     ：深澜 eportal JSONP (GET)
+//  适配学校：景德镇艺术职业大学（联通宽带，账号格式 ,0,<学号>@unicom）
+//  协议    ：深澜 eportal JSONP (GET)
 //
 //  特性：
 //    - 只填裸账号 + 密码，程序自动拼装账号前缀与运营商后缀
@@ -72,11 +72,11 @@ namespace SrunAutoLogin
 
         public static AppConfig Default()
         {
-            // 下面是深澜 eportal 的通用默认模板：门户地址、AC 地址等请按自己学校抓包结果填写。
-            // 保留示例值是为了让界面开箱可用，不改也能编译运行 —— 但认证前务必改成你学校的实际值。
+            // 默认值已按「景德镇艺术职业大学」的实测抓包结果预置，开箱即用。
+            // 其他深澜学校：改 PortalUrl 与 wlan_ac_ip（或整个 config.json）即可，无需重新编译。
             return new AppConfig
             {
-                PortalUrl = "http://192.168.1.1:801/eportal/portal/login",
+                PortalUrl = "http://172.22.1.46:801/eportal/portal/login",
                 LocalIpToken = "{local_ip}",
                 AccountPrefix = ",0,",
                 AccountSuffix = "@unicom",
@@ -89,7 +89,7 @@ namespace SrunAutoLogin
                     { "wlan_user_ip", "{local_ip}" },
                     { "wlan_user_ipv6", "" },
                     { "wlan_user_mac", "000000000000" },
-                    { "wlan_ac_ip", "" },
+                    { "wlan_ac_ip", "172.22.1.46" },
                     { "wlan_ac_name", "" },
                     { "jsVersion", "4.28" },
                     { "terminal_type", "1" },
@@ -811,7 +811,7 @@ namespace SrunAutoLogin
 
         internal MainForm(bool showWindow)
         {
-            Text = "深澜校园网自动认证";
+            Text = "深澜校园网自动认证 · 景德镇艺术职业大学";
             ClientSize = new Size(720, 684);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -862,7 +862,7 @@ namespace SrunAutoLogin
             };
             var sub = new Label
             {
-                Text = "深澜 eportal 认证 · 联网自动登录",
+                Text = "景德镇艺术职业大学 · 深澜 eportal 认证",
                 Font = new Font("Microsoft YaHei UI", 9F),
                 ForeColor = Ui.Muted,
                 BackColor = Color.Transparent,

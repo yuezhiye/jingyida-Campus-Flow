@@ -6,7 +6,10 @@
 //  特性：
 //    - 只填裸账号 + 密码，程序自动拼装账号前缀与运营商后缀
 //    - 认证成功判定基于返回 JSON 的 result 字段（精确，非关键词猜测）
-//    - 联网后自动停止轮询，断网/换网时唤醒
+//    - 选卡逻辑分级挑选：排除虚拟网卡 → 只认「有默认网关」的真实出口
+//      （关键字写错、装了 VirtualBox/VPN 也不会再挑到 192.168.56.1 这类地址）
+//    - 登录接口地址防呆：手填成门户首页（a79.htm 等）时自动还原为登录接口
+//    - 联网后转入低频探活，会话被踢掉也能自动重新认证
 //    - 密码用 Windows DPAPI 加密存储（绑定当前用户，不落明文）
 //    - 日志不记录账号密码
 //    - 所有可变项均从 config.json 读取，可移植到其他深澜学校
@@ -35,8 +38,8 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("SrunAutoLogin")]
 [assembly: System.Reflection.AssemblyProduct("SrunAutoLogin")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
 
 namespace SrunAutoLogin
 {
@@ -59,7 +62,7 @@ namespace SrunAutoLogin
         public string PasswordField { get; set; }
         /// <summary>固定附加参数（键值对）</summary>
         public Dictionary<string, string> ExtraParams { get; set; }
-        /// <summary>指定使用的网卡名关键字，空=自动选第一个私网 IPv4</summary>
+        /// <summary>指定使用的网卡名关键字，空=自动挑真实出口网卡（推荐）</summary>
         public string InterfaceKeyword { get; set; }
         /// <summary>联网检测地址</summary>
         public string ConnectivityUrl { get; set; }
@@ -95,7 +98,7 @@ namespace SrunAutoLogin
                     { "terminal_type", "1" },
                     { "lang", "zh-cn" }
                 },
-                InterfaceKeyword = "WLAN",
+                InterfaceKeyword = "",
                 ConnectivityUrl = "http://www.msftconnecttest.com/connecttest.txt",
                 ConnectivityExpected = "Microsoft Connect Test",
                 CheckIntervalSeconds = 30,
@@ -114,6 +117,8 @@ namespace SrunAutoLogin
         internal const string StopEventName = @"Local\SrunAutoLogin.Stop";
         internal const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         internal const string RunName = "SrunAutoLogin";
+        /// <summary>日志最多保留的行数</summary>
+        internal const int MaxLogLines = 200;
 
         internal static readonly string Dir =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppName);
@@ -152,6 +157,11 @@ namespace SrunAutoLogin
                         if (string.IsNullOrEmpty(cfg.LocalIpToken)) cfg.LocalIpToken = "{local_ip}";
                         if (cfg.CheckIntervalSeconds <= 0) cfg.CheckIntervalSeconds = 30;
                         if (cfg.TimeoutMs <= 0) cfg.TimeoutMs = 10000;
+
+                        // 防呆：config.json 被手改成门户首页（a79.htm 之类）时，运行时自动还原成登录接口，
+                        // 保证「即使配置写错，程序也不会拿着一个只会返回 HTML 的地址去认证」。
+                        string note;
+                        cfg.PortalUrl = SrunClient.NormalizePortalUrl(cfg.PortalUrl, out note);
                         return cfg;
                     }
                 }
@@ -207,15 +217,20 @@ namespace SrunAutoLogin
             try
             {
                 EnsureDir();
-                // 日志保留最近 200 行
                 string stamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                 File.AppendAllText(LogPath, stamp + "  " + message + Environment.NewLine, Encoding.UTF8);
 
+                // 只保留最近 MaxLogLines 行。
+                // 注意：旧版这里写回的是原数组，等于没截断，日志会无限增长。
                 if (File.Exists(LogPath))
                 {
                     string[] lines = File.ReadAllLines(LogPath, Encoding.UTF8);
-                    if (lines.Length > 200)
-                        File.WriteAllLines(LogPath, lines, Encoding.UTF8);
+                    if (lines.Length > MaxLogLines)
+                    {
+                        string[] keep = new string[MaxLogLines];
+                        Array.Copy(lines, lines.Length - MaxLogLines, keep, 0, MaxLogLines);
+                        File.WriteAllLines(LogPath, keep, Encoding.UTF8);
+                    }
                 }
             }
             catch { }
@@ -238,42 +253,122 @@ namespace SrunAutoLogin
             public string Raw = "";
         }
 
-        /// <summary>取本机私网 IPv4（优先 WLAN / 指定关键字网卡）</summary>
+        /// <summary>
+        /// 虚拟 / 隧道类网卡特征关键字。命中即认为「不是真实上网出口的网卡」，
+        /// 不允许它们提供的 IP 被提交给认证服务器。
+        /// </summary>
+        private static readonly string[] VirtualAdapterHints = new string[]
+        {
+            "VirtualBox", "VMware", "VMnet", "Hyper-V", "vEthernet", "Virtual Adapter",
+            "Radmin", "ZeroTier", "Tailscale", "Hamachi", "Npcap", "WinPcap",
+            "TAP-Windows", "TAP-Win32", "OpenVPN", "WireGuard", "AnyConnect", "EasyConnect",
+            "Sangfor", "深信服", "Parallels", "QEMU", "Docker", "WSL", "Netch",
+            "Wi-Fi Direct", "Bluetooth", "蓝牙", "Loopback",
+            "Teredo", "ISATAP", "6to4", "SSTP", "L2TP", "PPTP", "VPN"
+        };
+
+        /// <summary>网卡名/描述里是否含虚拟网卡特征</summary>
+        internal static bool IsVirtualAdapter(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            foreach (string hint in VirtualAdapterHints)
+                if (name.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
+
+        /// <summary>是否私网 IPv4（10/8、172.16/12、192.168/16）</summary>
+        internal static bool IsPrivateIpv4(string ip)
+        {
+            return ip.StartsWith("10.")
+                || ip.StartsWith("192.168.")
+                || IsPrivate172(ip);
+        }
+
+        /// <summary>取本机私网 IPv4（不关心网卡名）</summary>
         internal static string GetLocalIPv4(AppConfig cfg)
         {
-            string preferred = "";
-            string fallback = "";
+            string adapterName;
+            return GetLocalIPv4(cfg, out adapterName);
+        }
+
+        /// <summary>
+        /// 取本机内网 IPv4，并按优先级挑选可信候选；同时回传所用网卡的名称。
+        ///
+        /// 分级策略（越靠前越可信）：
+        ///   ① 关键字命中 + 非虚拟网卡 + 有默认网关 + 私网
+        ///   ② 非虚拟网卡 + 有默认网关 + 私网
+        ///   ③ 非虚拟网卡 + 私网
+        ///   ④ 私网（最后兜底，仅在极特殊环境下出现）
+        ///
+        /// 这样即使关键字写错（例如从 WiFi 切到有线后仍写着 WLAN），
+        /// 也只会挑到「真正有默认网关」的物理网卡，而不会再把
+        /// VirtualBox Host-Only 的 192.168.56.1 之类地址提交出去。
+        /// </summary>
+        internal static string GetLocalIPv4(AppConfig cfg, out string adapterName)
+        {
+            adapterName = "";
+
+            string ipKeyword = "", nameKeyword = "";
+            string ipGateway = "", nameGateway = "";
+            string ipAny     = "", nameAny     = "";
+            string ipLast    = "", nameLast    = "";
+
             try
             {
                 foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
-                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
-                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-
-                    string name = ni.Name + " " + ni.Description;
-                    bool keywordHit = !string.IsNullOrEmpty(cfg.InterfaceKeyword)
-                        && name.IndexOf(cfg.InterfaceKeyword, StringComparison.OrdinalIgnoreCase) >= 0;
-
-                    foreach (UnicastIPAddressInformation addr in ni.GetIPProperties().UnicastAddresses)
+                    try
                     {
-                        if (addr.Address.AddressFamily != AddressFamily.InterNetwork) continue;
-                        string ip = addr.Address.ToString();
-                        if (ip.StartsWith("169.254.")) continue;   // APIPA 忽略
-                        if (ip.StartsWith("127.")) continue;
+                        if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                        if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
 
-                        bool isPrivate = ip.StartsWith("10.")
-                            || ip.StartsWith("192.168.")
-                            || IsPrivate172(ip);
+                        string name = ni.Name + " " + ni.Description;
+                        bool isVirtual = IsVirtualAdapter(name);
 
-                        if (keywordHit && isPrivate && preferred.Length == 0) preferred = ip;
-                        if (isPrivate && fallback.Length == 0) fallback = ip;
+                        bool hasGateway = false;
+                        foreach (GatewayIPAddressInformation gw in ni.GetIPProperties().GatewayAddresses)
+                        {
+                            if (gw.Address != null && gw.Address.AddressFamily == AddressFamily.InterNetwork)
+                            {
+                                hasGateway = true;
+                                break;
+                            }
+                        }
+
+                        bool keywordHit = !string.IsNullOrEmpty(cfg.InterfaceKeyword)
+                            && name.IndexOf(cfg.InterfaceKeyword, StringComparison.OrdinalIgnoreCase) >= 0;
+
+                        foreach (UnicastIPAddressInformation addr in ni.GetIPProperties().UnicastAddresses)
+                        {
+                            if (addr.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                            string ip = addr.Address.ToString();
+                            if (ip.StartsWith("169.254.")) continue;   // APIPA 自动地址，忽略
+                            if (ip.StartsWith("127.")) continue;       // 环回，忽略
+                            if (!IsPrivateIpv4(ip)) continue;          // 只认私网地址
+
+                            if (ipKeyword.Length == 0 && keywordHit && hasGateway && !isVirtual)
+                            { ipKeyword = ip; nameKeyword = ni.Name; }
+                            if (ipGateway.Length == 0 && hasGateway && !isVirtual)
+                            { ipGateway = ip; nameGateway = ni.Name; }
+                            if (ipAny.Length == 0 && !isVirtual)
+                            { ipAny = ip; nameAny = ni.Name; }
+                            if (ipLast.Length == 0)
+                            { ipLast = ip; nameLast = ni.Name; }
+                        }
                     }
+                    catch { }   // 单块网卡读取失败不影响其他网卡
                 }
             }
             catch { }
-            return preferred.Length > 0 ? preferred : fallback;
+
+            if (ipKeyword.Length > 0) { adapterName = nameKeyword; return ipKeyword; }
+            if (ipGateway.Length > 0) { adapterName = nameGateway; return ipGateway; }
+            if (ipAny.Length > 0)     { adapterName = nameAny;     return ipAny; }
+            adapterName = nameLast;
+            return ipLast;
         }
 
+        /// <summary>是否 172.16.0.0/12 私网段</summary>
         internal static bool IsPrivate172(string ip)
         {
             string[] p = ip.Split('.');
@@ -281,6 +376,54 @@ namespace SrunAutoLogin
             return p.Length == 4 && p[0] == "172"
                 && int.TryParse(p[1], out second)
                 && second >= 16 && second <= 31;
+        }
+
+        /// <summary>
+        /// 登录接口地址防呆：把「门户跳转首页」自动还原成标准登录接口。
+        ///
+        /// 背景：README 里让人抓包抄 URL，很容易连地址栏的 a79.htm 一起抄进去。
+        /// 那个地址只会返回一整页 HTML，认证永远不可能成功（表现为日志里
+        /// result 为空、msg 为空）。这里按特征识别并纠正：
+        ///   http://172.22.1.46/a79.htm?userip=172.21.39.165&... 
+        ///     → http://172.22.1.46:801/eportal/portal/login
+        ///
+        /// 已经是对的地址、或者认不出来的地址，一律原样返回（不瞎改）。
+        /// </summary>
+        internal static string NormalizePortalUrl(string raw, out string note)
+        {
+            note = null;
+            if (string.IsNullOrWhiteSpace(raw)) return raw;
+
+            string s = raw.Trim();
+            if (s.IndexOf("://", StringComparison.Ordinal) < 0) s = "http://" + s;
+
+            try
+            {
+                Uri uri;
+                if (!Uri.TryCreate(s, UriKind.Absolute, out uri)) return raw;
+
+                string path = (uri.AbsolutePath ?? "").ToLowerInvariant();
+
+                // 已经是标准登录接口，原样返回
+                if (path.IndexOf("/eportal/portal/login") >= 0) return s;
+
+                // 门户首页特征：跳转页后缀 / 根路径 / 带门户跳转参数
+                bool looksLikeLanding =
+                       path.EndsWith(".htm") || path.EndsWith(".html")
+                    || path.EndsWith(".jsp") || path.EndsWith(".asp")
+                    || path == "/" || path.Length == 0
+                    || s.IndexOf("userip=", StringComparison.OrdinalIgnoreCase) >= 0
+                    || s.IndexOf("wlanacip=", StringComparison.OrdinalIgnoreCase) >= 0
+                    || s.IndexOf("usermac=", StringComparison.OrdinalIgnoreCase) >= 0
+                    || s.IndexOf("a79", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (!looksLikeLanding) return s;   // 认不出来就不动，交给用户判断
+
+                string fixedUrl = uri.Scheme + "://" + uri.Host + ":801/eportal/portal/login";
+                note = "登录接口地址疑似填成了门户首页，已自动纠正为：" + fixedUrl;
+                return fixedUrl;
+            }
+            catch { return raw; }
         }
 
         internal static string Expand(string value, AppConfig cfg)
@@ -355,15 +498,17 @@ namespace SrunAutoLogin
                 string[] cred = AppData.LoadCredential();
                 if (cred == null || cred[0].Length == 0) return "尚未保存账号密码";
 
-                string ip = GetLocalIPv4(cfg);
+                string adapterName;
+                string ip = GetLocalIPv4(cfg, out adapterName);
                 if (string.IsNullOrEmpty(ip)) return "未找到可用的内网 IPv4 地址";
 
                 string url = BuildLoginUrl(cred[0], cred[1], cfg);
                 string response = Get(url, cfg, BuildReferer(cfg));
 
                 SrunResult parsed = Parse(response);
-                AppData.Log(string.Format("认证返回 result={0} msg={1} (IP {2})",
-                    string.IsNullOrEmpty(parsed.Result) ? "?" : parsed.Result, parsed.Message, ip));
+                AppData.Log(string.Format("认证返回 result={0} msg={1} (IP {2}{3})",
+                    string.IsNullOrEmpty(parsed.Result) ? "?" : parsed.Result, parsed.Message, ip,
+                    string.IsNullOrEmpty(adapterName) ? "" : " / 网卡 " + adapterName));
 
                 if (parsed.Success)
                 {
@@ -372,8 +517,21 @@ namespace SrunAutoLogin
                     return parsed.AlreadyOnline ? "该 IP 已经在线，网络正常" : "认证成功（联网验证未通过，可稍后重试）";
                 }
 
+                // 针对「AC认证失败」给出可操作的原因提示：绝大多数情况是提交的 IP 不是真实出口网卡
+                if (parsed.Message.IndexOf("AC认证失败", StringComparison.Ordinal) >= 0)
+                {
+                    return "认证失败：" + parsed.Message
+                        + Environment.NewLine + Environment.NewLine
+                        + "当前提交的内网 IP：" + ip
+                        + (string.IsNullOrEmpty(adapterName) ? "" : "（网卡：" + adapterName + "）")
+                        + Environment.NewLine
+                        + "该地址不是本机真正联网的出口网卡。请点「刷新」确认右侧「内网 IP」"
+                        + "显示的是你正在上网的那块网卡；如果不对，调整「网卡关键字」"
+                        + "（例如有线填 以太网 / Killer，无线填 WLAN），或把关键字留空让程序自动挑选。";
+                }
+
                 if (parsed.Message.Length > 0) return "认证失败：" + parsed.Message;
-                return "认证失败：服务端未返回成功标识";
+                return "认证失败：服务端未返回成功标识（返回内容可能是 HTML 页面，请检查登录接口地址是否为 .../eportal/portal/login）";
             }
             catch (WebException ex)
             {
@@ -504,10 +662,14 @@ namespace SrunAutoLogin
     // ========================================================================
     internal static class BackgroundHost
     {
+        /// <summary>已联网状态下的探活间隔（秒）。低频探活的目的是及时发现「会话被校园网踢掉」。</summary>
+        private const int ConnectedProbeSeconds = 180;
+
         private static System.Threading.Timer timer;
         private static readonly object StateGate = new object();
         private static bool connected;
         private static bool checkQueued;
+        private static DateTime lastProbeUtc = DateTime.MinValue;
 
         internal static void Run()
         {
@@ -571,13 +733,34 @@ namespace SrunAutoLogin
 
         private static void Check()
         {
-            lock (StateGate) { if (connected) return; }
-
             AppConfig cfg = AppData.LoadConfig();
+
+            bool connectedNow;
+            lock (StateGate) { connectedNow = connected; }
+
+            // 已联网时不再高频轮询；改为每 ConnectedProbeSeconds 秒探活一次。
+            // 旧版一旦 connected=true 就永久早退，只有网卡事件才能唤醒，
+            // 结果是校园网把会话踢掉后程序一直装死，必须手动点「测试认证」。
+            if (connectedNow)
+            {
+                bool dueForProbe;
+                lock (StateGate)
+                {
+                    dueForProbe = (DateTime.UtcNow - lastProbeUtc).TotalSeconds >= ConnectedProbeSeconds;
+                    if (dueForProbe) lastProbeUtc = DateTime.UtcNow;
+                }
+                if (!dueForProbe) return;
+
+                if (SrunClient.HasInternet(cfg)) return;   // 仍然在线，继续安静待着
+
+                AppData.Log("探活发现网络已断开，恢复自动认证。");
+                SetConnected(false);
+            }
 
             if (SrunClient.HasInternet(cfg))
             {
                 SetConnected(true);
+                lock (StateGate) { lastProbeUtc = DateTime.UtcNow; }
                 return;
             }
 
@@ -808,6 +991,8 @@ namespace SrunAutoLogin
         private readonly ToolTip toolTip = new ToolTip();
 
         private bool allowClose;
+        private bool lastOnline;       // 缓存的联网状态，供界面同步渲染（避免 UI 线程发网络请求）
+        private bool probeRunning;     // 是否有后台探活任务在跑
 
         internal MainForm(bool showWindow)
         {
@@ -832,6 +1017,7 @@ namespace SrunAutoLogin
             statusTimer.Interval = 3000;
             statusTimer.Tick += delegate { RefreshStatus(); };
             statusTimer.Start();
+            RefreshStatus();   // 启动后立刻探一次，不用干等 3 秒
 
             FormClosing += OnFormClosing;
             Resize += delegate
@@ -966,6 +1152,11 @@ namespace SrunAutoLogin
             // 第二行：网卡关键字 + 内网 IP + 刷新
             AddLabel(netCard, "网卡关键字", 24, 124);
             StyleInput(netCard, txtInterface, 116, 120, 88);
+            toolTip.SetToolTip(txtInterface,
+                "留空 = 自动挑选真正联网的网卡（推荐）。\n" +
+                "也可以填关键字精确指定：有线填 以太网，无线填 WLAN，\n" +
+                "或填网卡品牌（如 Killer / Intel），WiFi 与有线都能命中。\n" +
+                "VirtualBox、VMware、VPN 等虚拟网卡会被自动排除。");
 
             var ipHint = new Label
             {
@@ -986,7 +1177,7 @@ namespace SrunAutoLogin
             var refreshIp = new PillButton
             {
                 Text = "刷新",
-                Location = new Point(392, 118),
+                Location = new Point(524, 118),
                 Size = new Size(68, 32),
                 Radius = 16,
                 BaseColor = Ui.Ghost,
@@ -1152,16 +1343,6 @@ namespace SrunAutoLogin
             parent.Controls.Add(input);
         }
 
-        private void StyleFlatButton(Button b, Color back, Color fore)
-        {
-            b.BackColor = back;
-            b.ForeColor = fore;
-            b.FlatStyle = FlatStyle.Flat;
-            b.FlatAppearance.BorderSize = 0;
-            b.Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold);
-            b.Cursor = Cursors.Hand;
-        }
-
         // ------------------------------------------------------------ 数据绑定
         private void LoadIntoUi()
         {
@@ -1208,19 +1389,61 @@ namespace SrunAutoLogin
         {
             AppConfig cfg = AppData.LoadConfig();
             cfg.InterfaceKeyword = txtInterface.Value.Trim();
-            string ip = SrunClient.GetLocalIPv4(cfg);
-            lblLocalIp.Text = string.IsNullOrEmpty(ip) ? "未找到" : ip;
-            lblLocalIp.ForeColor = string.IsNullOrEmpty(ip) ? Ui.Err : Ui.Ok;
+
+            string adapterName;
+            string ip = SrunClient.GetLocalIPv4(cfg, out adapterName);
+
+            if (string.IsNullOrEmpty(ip))
+            {
+                lblLocalIp.Text = "未找到（请检查网卡关键字）";
+                lblLocalIp.ForeColor = Ui.Err;
+                toolTip.SetToolTip(lblLocalIp, "没有找到任何可用于认证的内网 IPv4 地址。\n请确认已连上校园网，或调整「网卡关键字」。");
+                return;
+            }
+
+            lblLocalIp.Text = string.IsNullOrEmpty(adapterName) ? ip : ip + "（" + adapterName + "）";
+            lblLocalIp.ForeColor = Ui.Ok;
+            toolTip.SetToolTip(lblLocalIp,
+                "认证时将提交这个地址。\n所用网卡：" + (string.IsNullOrEmpty(adapterName) ? "未知" : adapterName));
         }
 
         private void RefreshStatus()
         {
-            AppConfig cfg = AppData.LoadConfig();
-            bool online = SrunClient.HasInternet(cfg);
+            // 先用缓存值刷新显示，保证界面永不阻塞；
+            // 真正的联网检测放到后台线程，回来后覆盖显示。
+            ApplyStatus(lastOnline);
+
+            if (probeRunning) return;
+            probeRunning = true;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool online = false;
+                try { online = SrunClient.HasInternet(AppData.LoadConfig()); }
+                catch { }
+
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        probeRunning = false;
+                        lastOnline = online;
+                        ApplyStatus(online);
+                    });
+                }
+                catch { probeRunning = false; }
+            });
+        }
+
+        private void ApplyStatus(bool online)
+        {
             DateTime last = File.Exists(AppData.LogPath) ? File.GetLastWriteTime(AppData.LogPath) : DateTime.MinValue;
             string lastTxt = last == DateTime.MinValue ? "无记录" : last.ToString("HH:mm");
+
             lblStatus.Text = online ? "网络已连通" : "待认证";
             statusDot.DotColor = online ? Ui.Ok : Ui.Warn;
+            statusDot.Ring = !online;
+            statusDot.Invalidate();   // 圆点改了颜色/样式要主动重绘，否则不会实时刷新
             lblStatus.ForeColor = online ? Ui.Ok : Ui.Text;
             lblStatus.Tag = lastTxt;
             toolTip.SetToolTip(lblStatus,
@@ -1231,7 +1454,23 @@ namespace SrunAutoLogin
         // ------------------------------------------------------------ 动作
         private void SaveAll(bool enableStartup)
         {
+            SaveAll(enableStartup, false);
+        }
+
+        private void SaveAll(bool enableStartup, bool quiet)
+        {
             AppConfig cfg = ReadConfigFromUi();
+
+            // 地址防呆：把手填的门户首页还原成登录接口，并让用户看到纠正结果
+            string portalNote;
+            string portalFixed = SrunClient.NormalizePortalUrl(cfg.PortalUrl, out portalNote);
+            if (portalNote != null)
+            {
+                cfg.PortalUrl = portalFixed;
+                txtPortal.Value = portalFixed;
+                AppData.Log(portalNote);
+            }
+
             if (string.IsNullOrWhiteSpace(cfg.PortalUrl))
             {
                 MessageBox.Show("登录接口地址不能为空。", "提示");
@@ -1242,6 +1481,7 @@ namespace SrunAutoLogin
                 MessageBox.Show("请填写账号。", "提示");
                 return;
             }
+
             AppData.SaveConfig(cfg);
             AppData.SaveCredential(txtAccount.Value.Trim(), txtPassword.Value);
 
@@ -1251,7 +1491,10 @@ namespace SrunAutoLogin
                 else StartupManager.Disable();
             }
             RefreshStatus();
-            MessageBox.Show("已保存。连接校园网后会在后台自动认证。", "完成");
+
+            string ok = "已保存。连接校园网后会在后台自动认证。";
+            string msg = portalNote == null ? ok : (portalNote + "\r\n\r\n" + ok);
+            if (!quiet || portalNote != null) MessageBox.Show(msg, "完成");
         }
 
         private void RunTest()
@@ -1261,7 +1504,7 @@ namespace SrunAutoLogin
                 MessageBox.Show("请先填写账号。", "提示");
                 return;
             }
-            SaveAll(false);
+            SaveAll(false, true);   // 测试时静默保存，避免多弹一个「已保存」窗口
 
             btnTest.Enabled = false;
             btnTest.Text = "测试中…";

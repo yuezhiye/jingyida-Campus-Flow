@@ -1,5 +1,7 @@
 {
   "_comment": "SrunAutoLogin 配置模板 - 适用于采用深澜（Srun）eportal 认证的校园网。把这个文件放成 %LocalAppData%\\SrunAutoLogin\\config.json 即可生效。",
+  "_comment_PortalUrl": "必须是【登录接口】而不是门户首页。正确形态：http://<门户IP>:801/eportal/portal/login 。若误填成 a79.htm 之类的跳转页，程序会自动纠正并在日志里记录。",
+  "_comment_InterfaceKeyword": "网卡关键字，用于挑选提交给认证服务器的内网 IP。留空 = 自动挑选（推荐）。填 以太网 / WLAN / Killer 等可精确指定；程序会自动排除 VirtualBox、VMware、VPN 等虚拟网卡，并优先选择带默认网关的真实出口网卡。",
 
   "PortalUrl": "http://192.168.1.1:801/eportal/portal/login",
   "LocalIpToken": "{local_ip}",
@@ -22,7 +24,7 @@
     "lang": "zh-cn"
   },
 
-  "InterfaceKeyword": "WLAN",
+  "InterfaceKeyword": "",
   "ConnectivityUrl": "http://www.msftconnecttest.com/connecttest.txt",
   "ConnectivityExpected": "Microsoft Connect Test",
   "CheckIntervalSeconds": 30,
